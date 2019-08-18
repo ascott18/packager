@@ -49,6 +49,33 @@ if [ -n "$TRAVIS" ]; then
 	fi
 fi
 
+
+# add some azure pipelines checks so we don't need to do it in the yaml file
+if [ -n "$TF_BUILD" ]; then
+	# don't need to run the packager for pull requests
+	if [ "$BUILD_REASON" = "PullRequest" ]; then
+		echo "Not packaging pull request."
+		exit 0
+	fi
+
+	if [[ "$BUILD_SOURCEBRANCH" = "refs/heads/"* ]]; then
+		# This build was triggered for a branch.
+		# (Tag-triggered builds would have a SOURCEBRANCH like "refs/tags/"* )
+		# don't need to run the packager if there is a tag pending
+		BUILD_TAG=$( git -C "$BUILD_SOURCESDIRECTORY" tag --points-at )
+		if [ -n "$BUILD_TAG" ]; then
+			echo "Found future tag \"${BUILD_TAG}\", not packaging."
+			exit 0
+		fi
+		# only want to package master, classic, or a tag
+		if [ "$BUILD_SOURCEBRANCH" != "refs/heads/master" ] && [ "$BUILD_SOURCEBRANCH" != "refs/heads/classic" ]; then
+			echo "Not packaging \"${BUILD_SOURCEBRANCH}\"."
+			exit 0
+		fi
+	fi
+fi
+
+
 ## USER OPTIONS
 
 # Secrets for uploading
