@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# release.sh generates a zippable addon directory from a Git or SVN checkout.
+# release.sh generates an addon zip file from a Git, SVN, or Mercurial checkout.
 #
 # This is free and unencumbered software released into the public domain.
 #
@@ -42,10 +42,18 @@ if [ -n "$TRAVIS" ]; then
 			exit 0
 		fi
 		# only want to package master, classic, or a tag
-		if [ "$TRAVIS_BRANCH" != "master" ] && [ "$TRAVIS_BRANCH" != "classic" ]; then
+		if [ "$TRAVIS_BRANCH" != "master" ] && [ "$TRAVIS_BRANCH" != "classic" ] && [ "$TRAVIS_BRANCH" != "develop" ]; then
 			echo "Not packaging \"${TRAVIS_BRANCH}\"."
 			exit 0
 		fi
+	fi
+fi
+# actions check to prevent duplicate builds
+if [[ -n "$GITHUB_ACTIONS" && "$GITHUB_REF" == "refs/heads"* ]]; then
+	GITHUB_TAG=$( git -C "$GITHUB_WORKSPACE" tag --points-at )
+	if [ -n "$GITHUB_TAG" ]; then
+		echo "Found future tag \"${GITHUB_TAG}\", not packaging."
+		exit 0
 	fi
 fi
 
@@ -90,7 +98,7 @@ topdir=
 releasedir=
 overwrite=
 nolib=
-line_ending=dos
+line_ending="dos"
 skip_copying=
 skip_externals=
 skip_localization=
@@ -112,8 +120,9 @@ classic=
 exit_code=0
 
 # Classic version info for special handling
-CLASSIC_INTERFACE="11302"
-CLASSIC_VERSION="1.13.2"
+declare -A CLASSIC_VERSIONS
+CLASSIC_VERSIONS["1.13.2"]="11302"
+CLASSIC_VERSIONS["1.13.3"]="11303"
 
 # Process command-line options
 usage() {
@@ -129,8 +138,8 @@ usage() {
 	echo "  -z               Skip zip file creation." >&2
 	echo "  -t topdir        Set top-level directory of checkout." >&2
 	echo "  -r releasedir    Set directory containing the package directory. Defaults to \"\$topdir/.release\"." >&2
-	echo "  -p curse-id      Set the project id used on CurseForge for localization and uploading." >&2
-	echo "  -w wowi-id       Set the addon id used on WoWInterface for uploading." >&2
+	echo "  -p curse-id      Set the project id used on CurseForge for localization and uploading. (Use 0 to unset the TOC value)" >&2
+	echo "  -w wowi-id       Set the addon id used on WoWInterface for uploading. (Use 0 to unset the TOC value)" >&2
 	echo "  -g game-version  Set the game version to use for CurseForge uploading." >&2
 	echo "  -m pkgmeta.yaml  Set the pkgmeta file to use." >&2
 }
@@ -140,27 +149,28 @@ while getopts ":celLzusop:dw:r:t:g:m:" opt; do
 	case $opt in
 	c)
 		# Skip copying files into the package directory.
-		skip_copying=true
+		skip_copying="true"
+		skip_upload="true"
 		;;
 	e)
 		# Skip checkout of external repositories.
-		skip_externals=true
+		skip_externals="true"
 		;;
 	l)
 		# Skip @localization@ keyword replacement.
-		skip_localization=true
+		skip_localization="true"
 		;;
 	L)
 		# Skip uploading to CurseForge.
-		skip_cf_upload=true
+		skip_cf_upload="true"
 		;;
 	d)
 		# Skip uploading.
-		skip_upload=true
+		skip_upload="true"
 		;;
 	o)
 		# Skip deleting any previous package directory.
-		overwrite=true
+		overwrite="true"
 		;;
 	p)
 		slug="$OPTARG"
@@ -174,11 +184,16 @@ while getopts ":celLzusop:dw:r:t:g:m:" opt; do
 		;;
 	s)
 		# Create a nolib package.
-		nolib=true
-		skip_externals=true
+		nolib="true"
+		skip_externals="true"
 		;;
 	t)
 		# Set the top-level directory of the checkout to a non-default value.
+		if [ ! -d "$OPTARG" ]; then
+			echo "Invalid argument for option \"-t\" - Directory \"$OPTARG\" does not exist." >&2
+			usage
+			exit 1
+		fi
 		topdir="$OPTARG"
 		;;
 	u)
@@ -187,20 +202,20 @@ while getopts ":celLzusop:dw:r:t:g:m:" opt; do
 		;;
 	z)
 		# Skip generating the zipfile.
-		skip_zipfile=true
+		skip_zipfile="true"
 		;;
 	g)
 		# Set version (x.y.z)
-		IFS=',' read -a V <<< "$OPTARG"
+		IFS=',' read -ra V <<< "$OPTARG"
 		for i in "${V[@]}"; do
 			if [[ ! "$i" =~ ^[0-9]+\.[0-9]+\.[0-9]+[a-z]?$ ]]; then
 				echo "Invalid argument for option \"-g\" ($OPTARG)" >&2
 				usage
 				exit 1
 			fi
-			if [ "$i" = "$CLASSIC_VERSION" ]; then
-				classic=true
-				toc_version="$CLASSIC_INTERFACE"
+			if [ -n "${CLASSIC_VERSIONS[$i]}" ]; then
+				classic="true"
+				toc_version="${CLASSIC_VERSIONS[$i]}"
 			fi
 		done
 		game_version="$OPTARG"
@@ -208,7 +223,7 @@ while getopts ":celLzusop:dw:r:t:g:m:" opt; do
 	m)
 		# Set the pkgmeta file.
 		if [ ! -f "$OPTARG" ]; then
-			echo "Invalid argument for option \"-m\" - File \"$OPTARG\" does not exist."
+			echo "Invalid argument for option \"-m\" - File \"$OPTARG\" does not exist." >&2
 			usage
 			exit 1
 		fi
@@ -220,7 +235,7 @@ while getopts ":celLzusop:dw:r:t:g:m:" opt; do
 		exit 1
 		;;
 	\?)
-		if [ "$OPTARG" != "?" -a "$OPTARG" != "h" ]; then
+		if [ "$OPTARG" != "?" ] && [ "$OPTARG" != "h" ]; then
 			echo "Unknown option \"-$OPTARG\"." >&2
 		fi
 		usage
@@ -233,19 +248,19 @@ shift $((OPTIND - 1))
 # Set $topdir to top-level directory of the checkout.
 if [ -z "$topdir" ]; then
 	dir=$( pwd )
-	if [ -d "$dir/.git" -o -d "$dir/.svn" -o -d "$dir/.hg" ]; then
+	if [ -d "$dir/.git" ] || [ -d "$dir/.svn" ] || [ -d "$dir/.hg" ]; then
 		topdir=.
 	else
 		dir=${dir%/*}
-		topdir=..
+		topdir=".."
 		while [ -n "$dir" ]; do
-			if [ -d "$topdir/.git" -o -d "$topdir/.svn" -o -d "$topdir/.hg" ]; then
+			if [ -d "$topdir/.git" ] || [ -d "$topdir/.svn" ] || [ -d "$topdir/.hg" ]; then
 				break
 			fi
 			dir=${dir%/*}
 			topdir="$topdir/.."
 		done
-		if [ ! -d "$topdir/.git" -a ! -d "$topdir/.svn" -a ! -d "$topdir/.hg" ]; then
+		if [ ! -d "$topdir/.git" ] && [ ! -d "$topdir/.svn" ] && [ ! -d "$topdir/.hg" ]; then
 			echo "No Git, SVN, or Hg checkout found." >&2
 			exit 1
 		fi
@@ -302,7 +317,10 @@ $topdir/*)	;;
 esac
 
 # Create the staging directory.
-mkdir -p "$releasedir"
+mkdir -p "$releasedir" 2>/dev/null || {
+	echo "Unable to create the release directory \"$releasedir\"." >&2
+	exit 1
+}
 
 # Expand $topdir and $releasedir to their absolute paths for string comparisons later.
 topdir=$( cd "$topdir" && pwd )
@@ -336,10 +354,11 @@ si_file_date_integer= # Turns into the last changed date (by UTC) of the file in
 si_file_timestamp= # Turns into the last changed date (by UTC) of the file in POSIX timestamp. e.g. 1209663296
 
 # SVN date helper function
+isgnudate=$( date --version &>/dev/null && echo "true" )
 strtotime() {
 	value="$1" # datetime string
 	format="$2" # strptime string
-	if date --version &>/dev/null; then # gnu
+	if [ -n "$isgnudate" ]; then # gnu
 		date -d "$value" +%s 2>/dev/null
 	else # bsd
 		date -j -f "$format" "$value" "+%s" 2>/dev/null
@@ -362,7 +381,7 @@ set_info_git() {
 	si_project_date_iso=$( TZ= printf "%(%Y-%m-%dT%H:%M:%SZ)T" "$si_project_timestamp" )
 	si_project_date_integer=$( TZ= printf "%(%Y%m%d%H%M%S)T" "$si_project_timestamp" )
 	# XXX --depth limits rev-list :\ [ ! -s "$(git rev-parse --git-dir)/shallow" ] || git fetch --unshallow --no-tags
-	si_project_revision=$( git -C "$si_repo_dir" rev-list --count $si_project_hash 2>/dev/null )
+	si_project_revision=$( git -C "$si_repo_dir" rev-list --count "$si_project_hash" 2>/dev/null )
 
 	# Get the tag for the HEAD.
 	si_previous_tag=
@@ -477,15 +496,15 @@ set_info_hg() {
 	else
 		_si_tip=$( hg --cwd "$si_repo_dir" log -r . --template '{rev}' 2>/dev/null )
 	fi
-	si_previous_tag=$( hg --cwd "$si_repo_dir" log -r $_si_tip --template '{latesttag}' 2>/dev/null )
-	# si_project_version=$( hg --cwd "$si_repo_dir" log -r $_si_tip --template "{ ifeq(changessincelatesttag, 0, latesttag, '{latesttag}-{changessincelatesttag}-m{node|short}') }" 2>/dev/null ) # git style
-	si_project_version=$( hg --cwd "$si_repo_dir" log -r $_si_tip --template "{ ifeq(changessincelatesttag, 0, latesttag, 'r{rev}') }" 2>/dev/null ) # svn style
+	si_previous_tag=$( hg --cwd "$si_repo_dir" log -r "$_si_tip" --template '{latesttag}' 2>/dev/null )
+	# si_project_version=$( hg --cwd "$si_repo_dir" log -r "$_si_tip" --template "{ ifeq(changessincelatesttag, 0, latesttag, '{latesttag}-{changessincelatesttag}-m{node|short}') }" 2>/dev/null ) # git style
+	si_project_version=$( hg --cwd "$si_repo_dir" log -r "$_si_tip" --template "{ ifeq(changessincelatesttag, 0, latesttag, 'r{rev}') }" 2>/dev/null ) # svn style
 	if [ "$si_previous_tag" = "$si_project_version" ]; then
 		# we're on a tag
 		si_tag=$si_previous_tag
 		si_previous_tag=$( hg --cwd "$si_repo_dir" log -r "last(parents($_si_tip))" --template '{latesttag}' 2>/dev/null )
 	fi
-	si_previous_revision=$( hg --cwd "$si_repo_dir" log -r $si_previous_tag --template '{rev}' 2>/dev/null )
+	si_previous_revision=$( hg --cwd "$si_repo_dir" log -r "$si_previous_tag" --template '{rev}' 2>/dev/null )
 }
 
 set_info_file() {
@@ -498,7 +517,7 @@ set_info_file() {
 		si_file_timestamp=$( git -C "$si_repo_dir" log --max-count=1 --format="%at" "$_si_file" 2>/dev/null )
 		si_file_date_iso=$( TZ= printf "%(%Y-%m-%dT%H:%M:%SZ)T" "$si_file_timestamp" )
 		si_file_date_integer=$( TZ= printf "%(%Y%m%d%H%M%S)T" "$si_file_timestamp" )
-		si_file_revision=$( git -C "$si_repo_dir" rev-list --count $si_file_hash 2>/dev/null ) # XXX checkout depth affects rev-list, see set_info_git
+		si_file_revision=$( git -C "$si_repo_dir" rev-list --count "$si_file_hash" 2>/dev/null ) # XXX checkout depth affects rev-list, see set_info_git
 	elif [ "$si_repo_type" = "svn" ]; then
 		_si_file="$1"
 		# Temporary file to hold results of "svn info".
@@ -598,23 +617,29 @@ fi
 package=
 manual_changelog=
 changelog=
-changelog_markup=plain
+changelog_markup="text"
 enable_nolib_creation=
 ignore=
-license=
 contents=
 nolib_exclude=
-wowi_gen_changelog=true
-wowi_archive=true
+wowi_gen_changelog="true"
+wowi_archive="true"
 declare -A relations=()
 
 parse_ignore() {
-	pkgmeta=$1
+	pkgmeta="$1"
 	[ -f "$pkgmeta" ] || return 1
+
+	checkpath="$topdir" # paths are relative to the topdir
+	copypath=""
+	if [ "$2" != "" ]; then
+		checkpath=$( dirname "$pkgmeta" )
+		copypath="$2/"
+	fi
 
 	yaml_eof=
 	while [ -z "$yaml_eof" ]; do
-		IFS='' read -r yaml_line || yaml_eof=true
+		IFS='' read -r yaml_line || yaml_eof="true"
 		# Strip any trailing CR character.
 		yaml_line=${yaml_line%$carriage_return}
 		case $yaml_line in
@@ -630,11 +655,11 @@ parse_ignore() {
 			yaml_listitem "$yaml_line"
 			if [ "$pkgmeta_phase" = "ignore" ]; then
 				pattern=$yaml_item
-				if [ -d "$topdir/$pattern" ]; then
-					pattern="$pattern/*"
-				elif [ ! -f "$topdir/$pattern" ]; then
+				if [ -d "$checkpath/$pattern" ]; then
+					pattern="$copypath$pattern/*"
+				elif [ ! -f "$checkpath/$pattern" ]; then
 					# doesn't exist so match both a file and a path
-					pattern="$pattern:$pattern/*"
+					pattern="$copypath$pattern:$copypath$pattern/*"
 				fi
 				if [ -z "$ignore" ]; then
 					ignore="$pattern"
@@ -650,7 +675,7 @@ parse_ignore() {
 if [ -f "$pkgmeta_file" ]; then
 	yaml_eof=
 	while [ -z "$yaml_eof" ]; do
-		IFS='' read -r yaml_line || yaml_eof=true
+		IFS='' read -r yaml_line || yaml_eof="true"
 		# Strip any trailing CR character.
 		yaml_line=${yaml_line%$carriage_return}
 		case $yaml_line in
@@ -663,15 +688,12 @@ if [ -f "$pkgmeta_file" ]; then
 			case $yaml_key in
 			enable-nolib-creation)
 				if [ "$yaml_value" = "yes" ]; then
-					enable_nolib_creation=true
+					enable_nolib_creation="true"
 				fi
-				;;
-			license-output)
-				license=$yaml_value
 				;;
 			manual-changelog)
 				changelog=$yaml_value
-				manual_changelog=true
+				manual_changelog="true"
 				;;
 			package-as)
 				package=$yaml_value
@@ -699,6 +721,9 @@ if [ -f "$pkgmeta_file" ]; then
 					pattern=$yaml_item
 					if [ -d "$topdir/$pattern" ]; then
 						pattern="$pattern/*"
+					elif [ ! -f "$topdir/$pattern" ]; then
+						# doesn't exist so match both a file and a path
+						pattern="$pattern:$pattern/*"
 					fi
 					if [ -z "$ignore" ]; then
 						ignore="$pattern"
@@ -728,10 +753,14 @@ if [ -f "$pkgmeta_file" ]; then
 					case $yaml_key in
 					filename)
 						changelog=$yaml_value
-						manual_changelog=true
+						manual_changelog="true"
 						;;
 					markup-type)
+						if [ "$yaml_value" = "markdown" ] || [ "$yaml_value" = "html" ]; then
 						changelog_markup=$yaml_value
+						else
+							changelog_markup="text"
+						fi
 						;;
 					esac
 					;;
@@ -745,14 +774,19 @@ fi
 
 # Add untracked/ignored files to the ignore list
 if [ "$repository_type" = "git" ]; then
-	_vcs_ignore=$( git -C "$topdir" ls-files --others | sed -e ':a' -e 'N' -e 's/\n/:/' -e 'ta' )
-	if [ -n "$_vcs_ignore" ]; then
+	OLDIFS=$IFS
+	IFS=$'\n'
+	for _vcs_ignore in $(git -C "$topdir" ls-files --others --directory); do
+		if [ -d "$topdir/$_vcs_ignore" ]; then
+			_vcs_ignore="$_vcs_ignore*"
+		fi
 		if [ -z "$ignore" ]; then
 			ignore="$_vcs_ignore"
 		else
 			ignore="$ignore:$_vcs_ignore"
 		fi
-	fi
+	done
+	IFS=$OLDIFS
 elif [ "$repository_type" = "svn" ]; then
 	# svn always being difficult.
 	OLDIFS=$IFS
@@ -786,19 +820,19 @@ tocfile=$(
 	if [[ -z "$filename" && -n "$package" ]]; then
 		# Handle having the core addon in a sub dir, which people have starting doing
 		# for some reason. Tons of caveats, just make the base dir your base addon people!
-		filename=$( ls $package/*.toc -1 2>/dev/null | head -n1 )
+		filename=$( ls "$package"/*.toc -1 2>/dev/null | head -n1 )
 	fi
-	echo $filename
+	echo "$filename"
 )
 if [[ -z "$tocfile" || ! -f "$topdir/$tocfile" ]]; then
-	echo "Could not find an addon TOC file. In another directory? Make sure it matches the 'package-as' in .pkgmeta"
+	echo "Could not find an addon TOC file. In another directory? Make sure it matches the 'package-as' in .pkgmeta" >&2
 	exit 1
 fi
 
 # Set the package name from the TOC filename.
 toc_name=$( basename "$tocfile" | sed 's/\.toc$//' )
 if [[ -n "$package" && "$package" != "$toc_name" ]]; then
-	echo "Addon package name does not match TOC file name."
+	echo "Addon package name does not match TOC file name." >&2
 	exit 1
 fi
 if [ -z "$package" ]; then
@@ -809,11 +843,15 @@ fi
 toc_file=$( sed -e '1s/^\xEF\xBB\xBF//' -e $'s/\r//g' "$topdir/$tocfile" ) # go away bom, crlf
 if [ -z "$toc_version" ]; then
 	toc_version=$( echo "$toc_file" | awk '/^## Interface:/ { print $NF }' )
-	if [ "$toc_version" = "$CLASSIC_INTERFACE" ]; then
-		classic=true
-		game_version="$CLASSIC_VERSION"
+	for v in "${!CLASSIC_VERSIONS[@]}"; do
+		if [ "$toc_version" = "${CLASSIC_VERSIONS[$v]}" ]; then
+			classic="true"
+			game_version="$v"
+			break
 	fi
+	done
 fi
+
 # Get the title of the project for using in the changelog.
 project=$( echo "$toc_file" | awk '/^## Title:/' | sed -e 's/## Title\s*:\s*\(.*\)\s*/\1/' -e 's/|c[0-9A-Fa-f]\{8\}//g' -e 's/|r//g' )
 # Grab CurseForge ID and WoWI ID from the TOC file if not set by the script.
@@ -825,14 +863,24 @@ if [ -z "$addonid" ]; then
 fi
 unset toc_file
 
+# unset project ids if they are set to 0
+[ "$slug" = "0" ] && slug=
+[ "$addonid" = "0" ] && addonid=
+
 echo
-echo "Packaging $package${classic:+ (classic)}${nolib:+ (nolib)}"
+echo "Packaging $package"
 if [ -n "$project_version" ]; then
 	echo "Current version: $project_version"
 fi
 if [ -n "$previous_version" ]; then
 	echo "Previous version: $previous_version"
 fi
+(
+	[ -n "$classic" ] && retail="non-retail" || retail="retail"
+	[ -n "$tag" ] && alpha="non-alpha" || alpha="alpha"
+	echo "Build type: ${retail} ${alpha} non-debug${nolib:+ nolib}"
+	echo
+)
 if [[ "$slug" =~ ^[0-9]+$ ]]; then
 	project_site="https://wow.curseforge.com"
 	echo "CurseForge ID: $slug${cf_token:+ [token set]}"
@@ -843,14 +891,16 @@ fi
 if [ -n "$project_github_slug" ]; then
 	echo "GitHub: $project_github_slug${github_token:+ [token set]}"
 fi
+if [ -n "$project_site" ] || [ -n "$addonid" ] || [ -n "$project_github_slug" ]; then
 echo
+fi
 echo "Checkout directory: $topdir"
 echo "Release directory: $releasedir"
 echo
 
 # Set $pkgdir to the path of the package directory inside $releasedir.
 pkgdir="$releasedir/$package"
-if [ -d "$pkgdir" -a -z "$overwrite" ]; then
+if [ -d "$pkgdir" ] && [ -z "$overwrite" ]; then
 	#echo "Removing previous package directory: $pkgdir"
 	rm -fr "$pkgdir"
 fi
@@ -888,22 +938,22 @@ simple_filter() {
 # Find URL of localization api.
 set_localization_url() {
 	localization_url=
-	if [ -n "$slug" -a -n "$cf_token" -a -n "$project_site" ]; then
+	if [ -n "$slug" ] && [ -n "$cf_token" ] && [ -n "$project_site" ]; then
 		localization_url="${project_site}/api/projects/$slug/localization/export"
 	fi
-	if [ -z "$localization_url" ]; then
+	if [ -z "$localization_url" ] && grep -rq --include="*.lua" "@localization"; then
 		echo "Skipping localization! Missing CurseForge API token and/or project id is invalid."
 		echo
 	fi
 }
 
 # Filter to handle @localization@ repository keyword replacement.
-# https://authors.curseforge.com/knowledge-base/world-of-warcraft/531-localization-substitutions
+# https://authors.curseforge.com/knowledge-base/projects/531-localization-substitutions/
 declare -A unlocalized_values=( ["english"]="ShowPrimary" ["comment"]="ShowPrimaryAsComment" ["blank"]="ShowBlankAsComment" ["ignore"]="Ignore" )
 localization_filter() {
 	_ul_eof=
 	while [ -z "$_ul_eof" ]; do
-		IFS='' read -r _ul_line || _ul_eof=true
+		IFS='' read -r _ul_line || _ul_eof="true"
 		# Strip any trailing CR character.
 		_ul_line=${_ul_line%$carriage_return}
 		case $_ul_line in
@@ -930,7 +980,8 @@ localization_filter() {
 			else
 				echo "    Warning! No locale set, using enUS." >&2
 			fi
-			# Generate a URL parameter string from the localization parameters. https://authors.curseforge.com/docs/api
+			# Generate a URL parameter string from the localization parameters.
+			# https://authors.curseforge.com/knowledge-base/projects/529-api
 			_ul_url_params=""
 			set -- ${_ul_params}
 			for _ul_param; do
@@ -951,7 +1002,7 @@ localization_filter() {
 						fi
 						;;
 					handle-unlocalized)
-						if [ "$_ul_value" != "english" -a -n "${unlocalized_values[$_ul_value]}" ]; then
+						if [ "$_ul_value" != "english" ] && [ -n "${unlocalized_values[$_ul_value]}" ]; then
 							_ul_url_params="${_ul_url_params}&unlocalized=${unlocalized_values[$_ul_value]}"
 						fi
 						;;
@@ -1002,7 +1053,7 @@ localization_filter() {
 				esac
 			done
 
-			if [ -z "$_cdt_localization" -o -z "$localization_url" ]; then
+			if [ -z "$_cdt_localization" ] || [ -z "$localization_url" ]; then
 				echo "    Skipping localization (${_ul_lang}${_ul_namespace})" >&2
 
 				# If the line isn't a TOC entry, print anything before the keyword.
@@ -1031,7 +1082,7 @@ localization_filter() {
 				else
 					# Parse out a single phrase. This is kind of expensive, but caching would be way too much effort to optimize for what is basically an edge case.
 					_ul_value=$( curl -s -H "x-api-token: $cf_token" "${_ul_url}" | awk -v url="$_ul_url" '/^{"error/ { o="    Error! "$0"\n           "url; print o >"/dev/stderr"; exit 1 } /<!DOCTYPE/ { print "    Error! Invalid output\n           "url >"/dev/stderr"; exit 1 } { print }' | sed -n '/L\["'"$_ul_singlekey"'"\]/p' | sed 's/^.* = "\(.*\)"/\1/' )
-					if [ -n "$_ul_value" -a "$_ul_value" != "$_ul_singlekey" ]; then
+					if [ -n "$_ul_value" ] && [ "$_ul_value" != "$_ul_singlekey" ]; then
 						# The result is different from the base value so print out the line.
 						echo "${_ul_prefix}${_ul_value}${_ul_line##*)@}"
 					fi
@@ -1061,18 +1112,18 @@ toc_filter() {
 	_trf_comment=
 	_trf_eof=
 	while [ -z "$_trf_eof" ]; do
-		IFS='' read -r _trf_line || _trf_eof=true
+		IFS='' read -r _trf_line || _trf_eof="true"
 		# Strip any trailing CR character.
 		_trf_line=${_trf_line%$carriage_return}
 		_trf_passthrough=
 		case $_trf_line in
 		"#@${_trf_token}@"*)
 			_trf_comment="# "
-			_trf_passthrough=true
+			_trf_passthrough="true"
 			;;
 		"#@end-${_trf_token}@"*)
 			_trf_comment=
-			_trf_passthrough=true
+			_trf_passthrough="true"
 			;;
 		esac
 		if [ -z "$_trf_passthrough" ]; then
@@ -1097,7 +1148,7 @@ toc_filter2() {
 	_trf_uncomment=
 	_trf_eof=
 	while [ -z "$_trf_eof" ]; do
-		IFS='' read -r _trf_line || _trf_eof=true
+		IFS='' read -r _trf_line || _trf_eof="true"
 		# Strip any trailing CR character.
 		_trf_line=${_trf_line%$carriage_return}
 		case $_trf_line in
@@ -1108,7 +1159,7 @@ toc_filter2() {
 		*"#@non-$_trf_token@"*)
 			# remove the tokens, remove the content
 			_trf_keep=$(( 1-_trf_action ))
-			_trf_uncomment=true
+			_trf_uncomment="true"
 			;;
 		*"#@end-$_trf_token@"*|*"#@end-non-$_trf_token@"*)
 			# remove the tokens
@@ -1158,19 +1209,19 @@ do_not_package_filter() {
 		_dnpf_end_token="<!--@end-$_dnpf_string@-->"
 		;;
 	esac
-	if [ -z "$_dnpf_start_token" -o -z "$_dnpf_end_token" ]; then
+	if [ -z "$_dnpf_start_token" ] || [ -z "$_dnpf_end_token" ]; then
 		cat
 	else
 		# Replace all content between the start and end tokens, inclusive, with a newline to match CF packager.
 		_dnpf_eof=
 		_dnpf_skip=
 		while [ -z "$_dnpf_eof" ]; do
-			IFS='' read -r _dnpf_line || _dnpf_eof=true
+			IFS='' read -r _dnpf_line || _dnpf_eof="true"
 			# Strip any trailing CR character.
 			_dnpf_line=${_dnpf_line%$carriage_return}
 			case $_dnpf_line in
 			*$_dnpf_start_token*)
-				_dnpf_skip=true
+				_dnpf_skip="true"
 				echo -n "${_dnpf_line%%${_dnpf_start_token}*}"
 				;;
 			*$_dnpf_end_token*)
@@ -1196,7 +1247,7 @@ do_not_package_filter() {
 line_ending_filter() {
 	_lef_eof=
 	while [ -z "$_lef_eof" ]; do
-		IFS='' read -r _lef_line || _lef_eof=true
+		IFS='' read -r _lef_line || _lef_eof="true"
 		# Strip any trailing CR character.
 		_lef_line=${_lef_line%$carriage_return}
 		if [ -n "$_lef_eof" ]; then
@@ -1237,16 +1288,16 @@ copy_directory_tree() {
 	OPTIND=1
 	while getopts :adi:lnpu:c _cdt_opt "$@"; do
 		case $_cdt_opt in
-		a)	_cdt_alpha=true ;;
-		d)	_cdt_debug=true ;;
+		a)	_cdt_alpha="true" ;;
+		d)	_cdt_debug="true" ;;
 		i)	_cdt_ignored_patterns=$OPTARG ;;
-		l)	_cdt_localization=true
+		l)	_cdt_localization="true"
 			set_localization_url
 			;;
-		n)	_cdt_nolib=true ;;
-		p)	_cdt_do_not_package=true ;;
+		n)	_cdt_nolib="true" ;;
+		p)	_cdt_do_not_package="true" ;;
 		u)	_cdt_unchanged_patterns=$OPTARG ;;
-		c)	_cdt_classic=true
+		c)	_cdt_classic="true"
 		esac
 	done
 	shift $((OPTIND - 1))
@@ -1269,7 +1320,7 @@ copy_directory_tree() {
 	esac
 	# Print the filename, but suppress the current directory ".".
 	_cdt_find_cmd="$_cdt_find_cmd -o \! -name \".\" -print"
-	( cd "$_cdt_srcdir" && eval $_cdt_find_cmd ) | while read file; do
+	( cd "$_cdt_srcdir" && eval "$_cdt_find_cmd" ) | while read -r file; do
 		file=${file#./}
 		if [ -f "$_cdt_srcdir/$file" ]; then
 			# Check if the file should be ignored.
@@ -1281,13 +1332,13 @@ copy_directory_tree() {
 			fi
 			# Skip files matching the colon-separated "ignored" shell wildcard patterns.
 			if [ -z "$skip_copy" ] && match_pattern "$_cdt_check_file" "$_cdt_ignored_patterns"; then
-				skip_copy=true
+				skip_copy="true"
 			fi
 			# Never skip files that match the colon-separated "unchanged" shell wildcard patterns.
 			unchanged=
 			if [ -n "$skip_copy" ] && match_pattern "$file" "$_cdt_unchanged_patterns"; then
 				skip_copy=
-				unchanged=true
+				unchanged="true"
 			fi
 			# Copy unskipped files into $_cdt_destdir.
 			if [ -n "$skip_copy" ]; then
@@ -1298,11 +1349,11 @@ copy_directory_tree() {
 					mkdir -p "$_cdt_destdir/$dir"
 				fi
 				# Check if the file matches a pattern for keyword replacement.
-				skip_filter=true
+				skip_filter="true"
 				if match_pattern "$file" "*.lua:*.md:*.toc:*.txt:*.xml"; then
 					skip_filter=
 				fi
-				if [ -n "$skip_filter" -o -n "$unchanged" ]; then
+				if [ -n "$skip_filter" ] || [ -n "$unchanged" ]; then
 					echo "  Copying: $file (unchanged)"
 					cp "$_cdt_srcdir/$file" "$_cdt_destdir/$dir"
 				else
@@ -1343,8 +1394,7 @@ copy_directory_tree() {
 					# POSIX does imply that text files must end in a newline.
 					set_info_file "$_cdt_srcdir/$file"
 					echo "  Copying: $file"
-					cat "$_cdt_srcdir/$file" \
-						| simple_filter \
+					simple_filter < "$_cdt_srcdir/$file" \
 						| $_cdt_alpha_filter \
 						| $_cdt_debug_filter \
 						| $_cdt_nolib_filter \
@@ -1379,23 +1429,13 @@ if [ -z "$skip_copying" ]; then
 	if [ -n "$changelog" ]; then
 		cdt_args="$cdt_args -u \"$changelog\""
 	fi
-	eval copy_directory_tree $cdt_args "\"$topdir\"" "\"$pkgdir\""
+	eval copy_directory_tree "$cdt_args" "\"$topdir\"" "\"$pkgdir\""
 	echo
 fi
 
 # Reset ignore and parse pkgmeta ignores again to handle ignoring external paths
 ignore=
 parse_ignore "$pkgmeta_file"
-
-###
-### Create a default license if not present and .pkgmeta requests one.
-###
-
-if [ -n "$license" -a ! -f "$topdir/$license" ]; then
-	echo "Generating license into $license."
-	echo "All Rights Reserved." | line_ending_filter > "$pkgdir/$license"
-	echo
-fi
 
 ###
 ### Process .pkgmeta again to perform any pre-move-folders actions.
@@ -1408,6 +1448,8 @@ checkout_external() {
 	_external_tag=$3
 	_external_type=$4
 	_external_slug=$5
+	_external_extra_type=$6
+
 	_cqe_checkout_dir="$pkgdir/$_external_dir/.checkout"
 	mkdir -p "$_cqe_checkout_dir"
 	echo
@@ -1416,35 +1458,42 @@ checkout_external() {
 			echo "Fetching latest version of external $_external_uri"
 			git clone -q --depth 1 "$_external_uri" "$_cqe_checkout_dir" || return 1
 		elif [ "$_external_tag" != "latest" ]; then
-			echo "Fetching tag \"$_external_tag\" from external $_external_uri"
-			git clone -q --depth 1 --branch "$_external_tag" "$_external_uri" "$_cqe_checkout_dir" || return 1
+			echo "Fetching $_external_extra_type \"$_external_tag\" from external $_external_uri"
+			if [ "$_external_extra_type" = "commit" ]; then
+				git clone -q "$_external_uri" "$_cqe_checkout_dir" || return 1
+				git -C "$_cqe_checkout_dir" checkout -q "$_external_tag" || return 1
+			else
+				git -c advice.detachedHead=false clone -q --depth 1 --branch "$_external_tag" "$_external_uri" "$_cqe_checkout_dir" || return 1
+			fi
 		else # [ "$_external_tag" = "latest" ]; then
 			git clone -q --depth 50 "$_external_uri" "$_cqe_checkout_dir" || return 1
 			_external_tag=$( git -C "$_cqe_checkout_dir" for-each-ref refs/tags --sort=-creatordate --format=%\(refname:short\) --count=1 )
 			if [ -n "$_external_tag" ]; then
 				echo "Fetching tag \"$_external_tag\" from external $_external_uri"
-				git -C "$_cqe_checkout_dir" checkout -q "$_external_tag"
+				git -C "$_cqe_checkout_dir" checkout -q "$_external_tag" || return 1
 			else
 				echo "Fetching latest version of external $_external_uri"
 			fi
 		fi
+
+		# pull submodules
+		git -C "$_cqe_checkout_dir" submodule -q update --init --recursive || return 1
+
 		set_info_git "$_cqe_checkout_dir"
 		echo "Checked out $( git -C "$_cqe_checkout_dir" describe --always --tags --long )" #$si_project_abbreviated_hash
 	elif [ "$_external_type" = "svn" ]; then
+		if [[ $external_uri == *"/trunk" ]]; then
+			_cqe_svn_trunk_url=$_external_uri
+			_cqe_svn_subdir=
+		else
+			_cqe_svn_trunk_url="${_external_uri%/trunk/*}/trunk"
+			_cqe_svn_subdir=${_external_uri#${_cqe_svn_trunk_url}/}
+		fi
+
 		if [ -z "$_external_tag" ]; then
 			echo "Fetching latest version of external $_external_uri"
 			svn checkout -q "$_external_uri" "$_cqe_checkout_dir" || return 1
 		else
-			case $_external_uri in
-			*/trunk)
-				_cqe_svn_trunk_url=$_external_uri
-				_cqe_svn_subdir=
-				;;
-			*)
-				_cqe_svn_trunk_url="${_external_uri%/trunk/*}/trunk"
-				_cqe_svn_subdir=${_external_uri#${_cqe_svn_trunk_url}/}
-				;;
-			esac
 			_cqe_svn_tag_url="${_cqe_svn_trunk_url%/trunk}/tags"
 			if [ "$_external_tag" = "latest" ]; then
 				_external_tag=$( svn log --verbose --limit 1 "$_cqe_svn_tag_url" 2>/dev/null | awk '/^   A \/tags\// { print $2; exit }' | awk -F/ '{ print $3 }' )
@@ -1472,7 +1521,7 @@ checkout_external() {
 			echo "Fetching latest version of external $_external_uri"
 			hg clone -q "$_external_uri" "$_cqe_checkout_dir" || return 1
 		elif [ "$_external_tag" != "latest" ]; then
-			echo "Fetching tag \"$_external_tag\" from external $_external_uri"
+			echo "Fetching $_external_extra_type \"$_external_tag\" from external $_external_uri"
 			hg clone -q --updaterev "$_external_tag" "$_external_uri" "$_cqe_checkout_dir" || return 1
 		else # [ "$_external_tag" = "latest" ]; then
 			hg clone -q "$_external_uri" "$_cqe_checkout_dir" || return 1
@@ -1502,7 +1551,7 @@ checkout_external() {
 			project_site="https://wow.curseforge.com"
 		fi
 		# If a .pkgmeta file is present, process it for an "ignore" list.
-		parse_ignore "$_cqe_checkout_dir/.pkgmeta"
+		parse_ignore "$_cqe_checkout_dir/.pkgmeta" "$_external_dir"
 		copy_directory_tree -dnp -i "$ignore" "$_cqe_checkout_dir" "$pkgdir/$_external_dir"
 	)
 	# Remove the ".checkout" subdirectory containing the full checkout.
@@ -1518,65 +1567,67 @@ external_uri=
 external_tag=
 external_type=
 external_slug=
+external_extra_type=
 process_external() {
-	if [[ -n "$external_dir" && -n "$external_uri" && -z "$skip_externals" ]]; then
-		# convert old curse repo urls and detect the type of new ones
-		# this could be condensed quite a bit.. a task for another day
+	if [ -n "$external_dir" ] && [ -n "$external_uri" ] && [ -z "$skip_externals" ]; then
+		# convert old curse repo urls
 		case $external_uri in
-		git:*|http://git*|https://git*)
-			[[ -z $external_type ]] && external_type="git"
-			if [[ "$external_uri" == "git://git.curseforge.com"* || "$external_uri" == "git://git.wowace.com"* ]]; then
-				# git://git.(curseforge|wowace).com/wow/$slug/mainline.git -> https://repos.curseforge.com/wow/$slug
+			*git.curseforge.com*|*git.wowace.com*)
+				external_type="git"
+				# git://git.curseforge.com/wow/$slug/mainline.git -> https://repos.curseforge.com/wow/$slug
 				external_uri=${external_uri%/mainline.git}
-				external_uri=${external_uri/#git:\/\/git/https://repos}
-			fi
+				external_uri="https://repos${external_uri#*://git}"
 			;;
-		svn:*|http://svn*|https://svn*)
-			[[ -z $external_type ]] && external_type="svn"
-			if [[ "$external_uri" == "svn://svn.curseforge.com"* || "$external_uri" == "svn://svn.wowace.com"* ]]; then
-				# svn://svn.(curseforge|wowace).com/wow/$slug/mainline/trunk -> https://repos.curseforge.com/wow/$slug/trunk
-				external_uri=${external_uri/\/mainline/}
-				external_uri=${external_uri/#svn:\/\/svn/https://repos}
-			fi
-			;;
-		http://hg*|https://hg*)
-			if [[ "$external_uri" == *"://hg.curseforge.com"* || "$external_uri" == *"://hg.wowace.com"* ]]; then
-				external_type="hg"
-				# https?://hg.(curseforge|wowace).com/wow/$slug/mainline -> https://repos.curseforge.com/wow/$slug
-				external_uri=${external_uri%/mainline}
-				external_uri=${external_uri/#http:/https:}
-				external_uri=${external_uri/#https:\/\/hg/https://repos}
-			fi
-			;;
-		https://repos.curseforge.com/wow/*|https://repos.wowace.com/wow/*)
-			_pe_path=${external_uri#*/wow/}
-			_pe_path=${_pe_path#*/} # remove the slug, leaving nothing for git or the svn path
-			# note: the svn repo trunk is usually used as the url with another field specifying a tag instead of using the tags dir directly
-			if [[ "$_pe_path" == "trunk"* || "$_pe_path" == "tags/"* ]]; then
+			*svn.curseforge.com*|*svn.wowace.com*)
 				external_type="svn"
-				if [[ "$_pe_path" == "tags"* ]]; then
-					external_tag=${_pe_path#tags/}
-					external_tag=${external_tag%%/*}
-					external_uri="${external_uri%/tags*}/trunk${_pe_path#tags/$external_tag}"
-				fi
-			elif [[ -z $external_type ]]; then
+				# svn://svn.curseforge.com/wow/$slug/mainline/trunk -> https://repos.curseforge.com/wow/$slug/trunk
+				external_uri=${external_uri/\/mainline/}
+				external_uri="https://repos${external_uri#*://svn}"
+			;;
+			*hg.curseforge.com*|*hg.wowace.com*)
+				external_type="hg"
+				# http://hg.curseforge.com/wow/$slug/mainline -> https://repos.curseforge.com/wow/$slug
+				external_uri=${external_uri%/mainline}
+				external_uri="https://repos${external_uri#*://hg}"
+			;;
+			svn:*)
+				# just in case
+				external_type="svn"
+				;;
+			*)
+				if [ -z "$external_type" ]; then
 				external_type="git"
 			fi
 			;;
 		esac
 
-		if [[ -z $external_slug ]] && [[ $external_uri == "https://repos.curseforge.com/wow/"* || $external_uri == "https://repos.wowace.com/wow/"* ]]; then
+		if [[ $external_uri == "https://repos.curseforge.com/wow/"* || $external_uri == "https://repos.wowace.com/wow/"* ]]; then
+			if [ -z "$external_slug" ]; then
 			external_slug=${external_uri#*/wow/}
 			external_slug=${external_slug%%/*}
 		fi
-		if [[ -n $external_slug ]]; then
+
+			# check if the repo is svn
+			_svn_path=${external_uri#*/wow/$external_slug/}
+			if [[ "$_svn_path" == "trunk"* ]]; then
+				external_type="svn"
+			elif [[ "$_svn_path" == "tags/"* ]]; then
+				external_type="svn"
+				# change the tag path into the trunk path and use the tag var so it gets logged as a tag
+				external_tag=${_svn_path#tags/}
+				external_tag=${external_tag%%/*}
+				external_uri="${external_uri%/tags*}/trunk${_svn_path#tags/$external_tag}"
+			fi
+		fi
+
+		if [ -n "$external_slug" ]; then
 			relations["$external_slug"]="embeddedLibrary"
 		fi
 
 		echo "Fetching external: $external_dir"
 		(
 			output_file="$releasedir/.${RANDOM}.externalout"
-			checkout_external "$external_dir" "$external_uri" "$external_tag" "$external_type" "$external_slug" &> "$output_file"
+			checkout_external "$external_dir" "$external_uri" "$external_tag" "$external_type" "$external_slug" "$external_extra_type" &> "$output_file"
 			status=$?
 			echo "$(<"$output_file")"
 			rm -f "$output_file" 2>/dev/null
@@ -1589,6 +1640,7 @@ process_external() {
 	external_tag=
 	external_type=
 	external_slug=
+	external_extra_type=
 }
 
 # Don't leave extra files around if exited early
@@ -1598,10 +1650,10 @@ kill_externals() {
 }
 trap kill_externals INT
 
-if [ -z "$skip_externals" -a -f "$pkgmeta_file" ]; then
+if [ -z "$skip_externals" ] && [ -f "$pkgmeta_file" ]; then
 	yaml_eof=
 	while [ -z "$yaml_eof" ]; do
-		IFS='' read -r yaml_line || yaml_eof=true
+		IFS='' read -r yaml_line || yaml_eof="true"
 		# Strip any trailing CR character.
 		yaml_line=${yaml_line%$carriage_return}
 		case $yaml_line in
@@ -1625,7 +1677,18 @@ if [ -z "$skip_externals" -a -f "$pkgmeta_file" ]; then
 				externals)
 					case $yaml_key in
 					url) external_uri=$yaml_value ;;
-					tag) external_tag=$yaml_value ;;
+					tag)
+						external_tag=$yaml_value
+						external_extra_type=$yaml_key
+						;;
+					branch)
+						external_tag=$yaml_value
+						external_extra_type=$yaml_key
+						;;
+					commit)
+						external_tag=$yaml_value
+						external_extra_type=$yaml_key
+						;;
 					type) external_type=$yaml_value ;;
 					curse-slug) external_slug=$yaml_value ;;
 					*)
@@ -1655,13 +1718,13 @@ if [ -z "$skip_externals" -a -f "$pkgmeta_file" ]; then
 		echo
 		echo "Waiting for externals to finish..."
 		for i in ${!external_pids[*]}; do
-			if ! wait ${external_pids[i]}; then
+			if ! wait "${external_pids[i]}"; then
 				_external_error=1
 			fi
 		done
 		if [ -n "$_external_error" ]; then
 			echo
-			echo "There was an error fetching externals :("
+			echo "There was an error fetching externals :(" >&2
 			exit 1
 		fi
 		echo
@@ -1681,11 +1744,7 @@ fi
 
 # Create a changelog in the package directory if the source directory does
 # not contain a manual changelog.
-if [ -z "$changelog" ]; then
-	changelog="CHANGELOG.md"
-	changelog_markup="markdown"
-fi
-if [[ -n "$manual_changelog" && -f "$topdir/$changelog" ]]; then
+if [ -n "$manual_changelog" ] && [ -f "$topdir/$changelog" ]; then
 	echo "Using manual changelog at $changelog"
 	echo
 	head -n7 "$topdir/$changelog"
@@ -1696,7 +1755,7 @@ if [[ -n "$manual_changelog" && -f "$topdir/$changelog" ]]; then
 		# Convert Markdown to BBCode (with HTML as an intermediary) for sending to WoWInterface
 		# Requires pandoc (http://pandoc.org/)
 		_html_changelog=
-		if which pandoc &>/dev/null; then
+		if pandoc --version &>/dev/null; then
 			_html_changelog=$( pandoc -t html "$topdir/$changelog" )
 		fi
 		if [ -n "$_html_changelog" ]; then
@@ -1733,14 +1792,14 @@ if [[ -n "$manual_changelog" && -f "$topdir/$changelog" ]]; then
 				# -e 's/^[ \t]*//g' \
 		fi
 	fi
-fi
-if [ ! -f "$topdir/$changelog" -a ! -f "$topdir/CHANGELOG.txt" -a ! -f "$topdir/CHANGELOG.md" ]; then
+else
 	if [ -n "$manual_changelog" ]; then
 		echo "Warning! Could not find a manual changelog at $topdir/$changelog"
 		manual_changelog=
+	fi
 		changelog="CHANGELOG.md"
 		changelog_markup="markdown"
-	fi
+
 	echo "Generating changelog of commits into $changelog"
 
 	if [ "$repository_type" = "git" ]; then
@@ -1749,33 +1808,33 @@ if [ ! -f "$topdir/$changelog" -a ! -f "$topdir/CHANGELOG.txt" -a ! -f "$topdir/
 		changelog_url_wowi=
 		changelog_version_wowi=
 		_changelog_range=
-		if [ -z "$previous_version" -a -z "$tag" ]; then
+		if [ -z "$previous_version" ] && [ -z "$tag" ]; then
 			# no range, show all commits up to ours
-			changelog_url="[Full Changelog](${project_github_url}/commits/$project_hash)"
-			changelog_version="[$project_version](${project_github_url}/tree/$project_hash)"
-			changelog_url_wowi="[url=${project_github_url}/commits/$project_hash]Full Changelog[/url]"
-			changelog_version_wowi="[url=${project_github_url}/tree/$project_hash]$project_version[/url]"
+			changelog_url="[Full Changelog](${project_github_url}/commits/${project_hash})"
+			changelog_version="[${project_version}](${project_github_url}/tree/${project_hash})"
+			changelog_url_wowi="[url=${project_github_url}/commits/${project_hash}]Full Changelog[/url]"
+			changelog_version_wowi="[url=${project_github_url}/tree/${project_hash}]${project_version}[/url]"
 			_changelog_range="$project_hash"
-		elif [ -z "$previous_version" -a -n "$tag" ]; then
+		elif [ -z "$previous_version" ] && [ -n "$tag" ]; then
 			# first tag, show all commits upto it
-			changelog_url="[Full Changelog](${project_github_url}/commits/$tag)"
-			changelog_version="[$project_version](${project_github_url}/tree/$tag)"
-			changelog_url_wowi="[url=${project_github_url}/commits/$tag]Full Changelog[/url]"
-			changelog_version_wowi="[url=${project_github_url}/tree/$tag]$project_version[/url]"
+			changelog_url="[Full Changelog](${project_github_url}/commits/${tag})"
+			changelog_version="[${project_version}](${project_github_url}/tree/${tag})"
+			changelog_url_wowi="[url=${project_github_url}/commits/${tag}]Full Changelog[/url]"
+			changelog_version_wowi="[url=${project_github_url}/tree/${tag}]${project_version}[/url]"
 			_changelog_range="$tag"
-		elif [ -n "$previous_version" -a -z "$tag" ]; then
+		elif [ -n "$previous_version" ] && [ -z "$tag" ]; then
 			# compare between last tag and our commit
-			changelog_url="[Full Changelog](${project_github_url}/compare/$previous_version...$project_hash)"
-			changelog_version="[$project_version](${project_github_url}/tree/$project_hash)"
-			changelog_url_wowi="[url=${project_github_url}/compare/$previous_version...$project_hash]Full Changelog[/url]"
-			changelog_version_wowi="[url=${project_github_url}/tree/$project_hash]$project_version[/url]"
+			changelog_url="[Full Changelog](${project_github_url}/compare/${previous_version}...${project_hash})"
+			changelog_version="[$project_version](${project_github_url}/tree/${project_hash})"
+			changelog_url_wowi="[url=${project_github_url}/compare/${previous_version}...${project_hash}]Full Changelog[/url]"
+			changelog_version_wowi="[url=${project_github_url}/tree/${project_hash}]${project_version}[/url]"
 			_changelog_range="$previous_version..$project_hash"
-		elif [ -n "$previous_version" -a -n "$tag" ]; then
+		elif [ -n "$previous_version" ] && [ -n "$tag" ]; then
 			# compare between last tag and our tag
-			changelog_url="[Full Changelog](${project_github_url}/compare/$previous_version...$tag)"
-			changelog_version="[$project_version](${project_github_url}/tree/$tag)"
-			changelog_url_wowi="[url=${project_github_url}/compare/$previous_version...$tag]Full Changelog[/url]"
-			changelog_version_wowi="[url=${project_github_url}/tree/$tag]$project_version[/url]"
+			changelog_url="[Full Changelog](${project_github_url}/compare/${previous_version}...${tag})"
+			changelog_version="[$project_version](${project_github_url}/tree/${tag})"
+			changelog_url_wowi="[url=${project_github_url}/compare/${previous_version}...${tag}]Full Changelog[/url]"
+			changelog_version_wowi="[url=${project_github_url}/tree/${tag}]${project_version}[/url]"
 			_changelog_range="$previous_version..$tag"
 		fi
 		# lazy way out
@@ -1783,7 +1842,7 @@ if [ ! -f "$topdir/$changelog" -a ! -f "$topdir/CHANGELOG.txt" -a ! -f "$topdir/
 			changelog_url=
 			changelog_version=$project_version
 			changelog_url_wowi=
-			changelog_version_wowi="[color=orange]$project_version[/color]"
+			changelog_version_wowi="[color=orange]${project_version}[/color]"
 		fi
 		changelog_date=$( TZ= printf "%(%Y-%m-%d)T" "$project_timestamp" )
 
@@ -1794,7 +1853,7 @@ if [ ! -f "$topdir/$changelog" -a ! -f "$topdir/CHANGELOG.txt" -a ! -f "$topdir/
 		$changelog_url
 
 		EOF
-		git -C "$topdir" log $_changelog_range --pretty=format:"###%B" \
+		git -C "$topdir" log "$_changelog_range" --pretty=format:"###%B" \
 			| sed -e 's/^/    /g' -e 's/^ *$//g' -e 's/^    ###/- /g' -e 's/$/  /' \
 			      -e 's/\([a-zA-Z0-9]\)_\([a-zA-Z0-9]\)/\1\\_\2/g' \
 			      -e 's/\[ci skip\]//g' -e 's/\[skip ci\]//g' \
@@ -1804,19 +1863,19 @@ if [ ! -f "$topdir/$changelog" -a ! -f "$topdir/CHANGELOG.txt" -a ! -f "$topdir/
 
 		# WoWI uses BBCode, generate something usable to post to the site
 		# the file is deleted on successful upload
-		if [ -n "$addonid" -a -n "$tag" -a -n "$wowi_gen_changelog" ]; then
+		if [ -n "$addonid" ] && [ -n "$tag" ] && [ -n "$wowi_gen_changelog" ]; then
 			changelog_previous_wowi=
-			if [ -n "$project_github_url" -a -n "$github_token" ]; then
+			if [ -n "$project_github_url" ] && [ -n "$github_token" ]; then
 				changelog_previous_wowi="[url=${project_github_url}/releases]Previous releases[/url]"
 			fi
 			wowi_changelog="$releasedir/WOWI-$project_version-CHANGELOG.txt"
 			cat <<- EOF | line_ending_filter > "$wowi_changelog"
-			[size=5]$project[/size]
-			[size=4]$changelog_version_wowi ($changelog_date)[/size]
-			$changelog_url_wowi $changelog_previous_wowi
+			[size=5]${project}[/size]
+			[size=4]${changelog_version_wowi} (${changelog_date})[/size]
+			${changelog_url_wowi} ${changelog_previous_wowi}
 			[list]
 			EOF
-			git -C "$topdir" log $_changelog_range --pretty=format:"###%B" \
+			git -C "$topdir" log "$_changelog_range" --pretty=format:"###%B" \
 				| sed -e 's/^/    /g' -e 's/^ *$//g' -e 's/^    ###/[*]/g' \
 				      -e 's/\[ci skip\]//g' -e 's/\[skip ci\]//g' \
 				      -e '/git-svn-id:/d' -e '/^\s*This reverts commit [0-9a-f]\{40\}\.\s*$/d' \
@@ -1838,7 +1897,7 @@ if [ ! -f "$topdir/$changelog" -a ! -f "$topdir/CHANGELOG.txt" -a ! -f "$topdir/
 		## $project_version ($changelog_date)
 
 		EOF
-		svn log "$topdir" $_changelog_range --xml \
+		svn log "$topdir" "$_changelog_range" --xml \
 			| awk '/<msg>/,/<\/msg>/' \
 			| sed -e 's/<msg>/###/g' -e 's/<\/msg>//g' \
 			      -e 's/^/    /g' -e 's/^ *$//g' -e 's/^    ###/- /g' -e 's/$/  /' \
@@ -1849,15 +1908,15 @@ if [ ! -f "$topdir/$changelog" -a ! -f "$topdir/CHANGELOG.txt" -a ! -f "$topdir/
 
 		# WoWI uses BBCode, generate something usable to post to the site
 		# the file is deleted on successful upload
-		if [ -n "$addonid" -a -n "$tag" -a -n "$wowi_gen_changelog" ]; then
+		if [ -n "$addonid" ] && [ -n "$tag" ] && [ -n "$wowi_gen_changelog" ]; then
 			wowi_changelog="$releasedir/WOWI-$project_version-CHANGELOG.txt"
 			cat <<- EOF | line_ending_filter > "$wowi_changelog"
-			[size=5]$project[/size]
-			[size=4][color=orange]$project_version[/color] ($changelog_date)[/size]
+			[size=5]${project}[/size]
+			[size=4][color=orange]${project_version}[/color] (${changelog_date})[/size]
 
 			[list]
 			EOF
-			svn log "$topdir" $_changelog_range --xml \
+			svn log "$topdir" "$_changelog_range" --xml \
 				| awk '/<msg>/,/<\/msg>/' \
 				| sed -e 's/<msg>/###/g' -e 's/<\/msg>//g' \
 				      -e 's/^/    /g' -e 's/^ *$//g' -e 's/^    ###/[*]/g' \
@@ -1884,21 +1943,21 @@ if [ ! -f "$topdir/$changelog" -a ! -f "$topdir/CHANGELOG.txt" -a ! -f "$topdir/
 
 		# WoWI uses BBCode, generate something usable to post to the site
 		# the file is deleted on successful upload
-		if [ -n "$addonid" -a -n "$tag" -a -n "$wowi_gen_changelog" ]; then
+		if [ -n "$addonid" ] && [ -n "$tag" ] && [ -n "$wowi_gen_changelog" ]; then
 			wowi_changelog="$releasedir/WOWI-$project_version-CHANGELOG.txt"
 			cat <<- EOF | line_ending_filter > "$wowi_changelog"
-			[size=5]$project[/size]
-			[size=4][color=orange]$project_version[/color] ($changelog_date)[/size]
+			[size=5]${project}[/size]
+			[size=4][color=orange]${project_version}[/color] (${changelog_date})[/size]
 
 			[list]
 			EOF
-			hg --cwd "$topdir" log $_changelog_range --template '[*]{desc|strip|escape}\n' | line_ending_filter >> "$wowi_changelog"
+			hg --cwd "$topdir" log "$_changelog_range" --template '[*]{desc|strip|escape}\n' | line_ending_filter >> "$wowi_changelog"
 			echo "[/list]" | line_ending_filter >> "$wowi_changelog"
 		fi
 	fi
 
 	echo
-	cat "$pkgdir/$changelog"
+	echo "$(<"$pkgdir/$changelog")"
 	echo
 fi
 
@@ -1909,7 +1968,7 @@ fi
 if [ -f "$pkgmeta_file" ]; then
 	yaml_eof=
 	while [ -z "$yaml_eof" ]; do
-		IFS='' read -r yaml_line || yaml_eof=true
+		IFS='' read -r yaml_line || yaml_eof="true"
 		# Strip any trailing CR character.
 		yaml_line=${yaml_line%$carriage_return}
 		case $yaml_line in
@@ -1941,10 +2000,6 @@ if [ -f "$pkgmeta_file" ]; then
 						echo "Moving $yaml_key to $yaml_value"
 						mv -f "$srcdir"/* "$destdir" && rm -fr "$srcdir"
 						contents="$contents $yaml_value"
-						# Copy the license into $destdir if one doesn't already exist.
-						if [ -n "$license" -a -f "$pkgdir/$license" -a ! -f "$destdir/$license" ]; then
-							cp -f "$pkgdir/$license" "$destdir/$license"
-						fi
 						# Check to see if the base source directory is empty
 						_mf_basedir=${srcdir%$(basename "$yaml_key")}
 						if [ ! "$( ls -A "$_mf_basedir" )" ]; then
@@ -1974,7 +2029,7 @@ if [ -z "$skip_zipfile" ]; then
 	archive_package_name="${package//[^A-Za-z0-9._-]/_}"
 
 	classic_tag=
-	if [ -n "$classic" ] && [[ "${project_version,,}" != *"classic"* ]]; then
+	if [[ -n "$classic" && "${project_version,,}" != *"classic"* ]]; then
 		# if it's a classic build, and classic isn't in the name, append it for clarity
 		classic_tag="-classic"
 	fi
@@ -2007,11 +2062,11 @@ if [ -z "$skip_zipfile" ]; then
 	echo
 
 	# Create nolib version of the zipfile
-	if [ -n "$enable_nolib_creation" -a -z "$nolib" -a -n "$nolib_exclude" ]; then
+	if [ -n "$enable_nolib_creation" ] && [ -z "$nolib" ] && [ -n "$nolib_exclude" ]; then
 		echo "Creating no-lib archive: $nolib_archive_name"
 
 		# run the nolib_filter
-		find "$pkgdir" -type f \( -name "*.xml" -o -name "*.toc" \) -print | while read file; do
+		find "$pkgdir" -type f \( -name "*.xml" -o -name "*.toc" \) -print | while read -r file; do
 			case $file in
 			*.toc)	_filter="toc_filter2 no-lib-strip" ;;
 			*.xml)	_filter="xml_filter no-lib-strip" ;;
@@ -2042,7 +2097,7 @@ if [ -z "$skip_zipfile" ]; then
 	upload_wowinterface=$( [[ -z "$skip_upload" && -n "$tag" && -n "$addonid" && -n "$wowi_token" ]] && echo true )
 	upload_github=$( [[ -z "$skip_upload" && -n "$tag" && -n "$project_github_slug" && -n "$github_token" ]] && echo true )
 
-	if [ -n "$upload_curseforge" -o -n "$upload_wowinterface" -o -n "$upload_github" ] && ! which jq &>/dev/null; then
+	if [[ -n "$upload_curseforge" || -n "$upload_wowinterface" || -n "$upload_github" ]] && ! jq --version &>/dev/null; then
 		echo "Skipping upload because \"jq\" was not found."
 		echo
 		upload_curseforge=
@@ -2057,19 +2112,19 @@ if [ -z "$skip_zipfile" ]; then
 			if [ -n "$game_version" ]; then
 				game_version_id=$(
 					_v=
-					IFS=',' read -a V <<< "$game_version"
+					IFS=',' read -ra V <<< "$game_version"
 					for i in "${V[@]}"; do
 						_v="$_v,\"$i\""
 					done
 					_v="[${_v#,}]"
 					# jq -c '["8.0.1","7.3.5"] as $v | map(select(.name as $x | $v | index($x)) | .id)'
-					echo "$_cf_versions" | jq -c --argjson v $_v 'map(select(.name as $x | $v | index($x)) | .id) | select(length > 0)' 2>/dev/null
+					echo "$_cf_versions" | jq -c --argjson v "$_v" 'map(select(.name as $x | $v | index($x)) | .id) | select(length > 0)' 2>/dev/null
 				)
 				if [ -n "$game_version_id" ]; then
 					# and now the reverse, since an invalid version will just be dropped (jq newlines are crlf on windows /wrists)
 					game_version=$(
 						_v=
-						V=($( echo $_cf_versions | jq -r --argjson v $game_version_id '.[] | select(.id as $x | $v | index($x)) | .name' 2>/dev/null ))
+						mapfile -t V < <( echo "$_cf_versions" | jq -r --argjson v "$game_version_id" '.[] | select(.id as $x | $v | index($x)) | .name' 2>/dev/null )
 						for i in "${V[@]}"; do
 							_v="$_v,${i%%[[:cntrl:]]}"
 						done
@@ -2079,8 +2134,8 @@ if [ -z "$skip_zipfile" ]; then
 			fi
 			if [ -z "$game_version_id" ]; then
 				# 517 = retail, 67408 = classic
-				game_version_id=$( echo $_cf_versions | jq -c 'map(select(.gameVersionTypeID == 517)) | max_by(.id) | [.id]' 2>/dev/null )
-				game_version=$( echo $_cf_versions | jq -r 'map(select(.gameVersionTypeID == 517)) | max_by(.id) | .name' 2>/dev/null )
+				game_version_id=$( echo "$_cf_versions" | jq -c 'map(select(.gameVersionTypeID == 517)) | max_by(.id) | [.id]' 2>/dev/null )
+				game_version=$( echo "$_cf_versions" | jq -r 'map(select(.gameVersionTypeID == 517)) | max_by(.id) | .name' 2>/dev/null )
 			fi
 		fi
 		if [ -z "$game_version_id" ]; then
@@ -2103,7 +2158,7 @@ if [ -z "$skip_zipfile" ]; then
 		#      or release depending on the tag itself:
 		#        - If the tag contains the word "alpha", it will be marked as an alpha file.
 		#        - If instead the tag contains the word "beta", it will be marked as a beta file.
-		# https://authors.curseforge.com/docs/packaging
+		# https://authors.curseforge.com/knowledge-base/projects/3451-automatic-packaging
 		file_type="alpha"
 		if [ -n "$tag" ]; then
 			if [[ "${tag,,}" == *"alpha"* ]]; then
@@ -2120,8 +2175,8 @@ if [ -z "$skip_zipfile" ]; then
 		  "displayName": "$project_version$classic_tag",
 		  "gameVersions": $game_version_id,
 		  "releaseType": "$file_type",
-		  "changelog": $( cat "$pkgdir/$changelog" | jq --slurp --raw-input '.' ),
-		  "changelogType": "markdown"
+		  "changelog": $( jq --slurp --raw-input '.' < "$pkgdir/$changelog" ),
+		  "changelogType": "$changelog_markup"
 		}
 		EOF
 		)
@@ -2173,12 +2228,12 @@ if [ -z "$skip_zipfile" ]; then
 	if [ -n "$upload_wowinterface" ]; then
 		_wowi_versions=$( curl -s -H "x-api-token: $wowi_token" https://api.wowinterface.com/addons/compatible.json )
 		if [ -n "$_wowi_versions" ]; then
-			game_version=$( echo $_wowi_versions | jq -r '.[] | select(.interface == "'$toc_version'" and .default == true) | .id' 2>/dev/null )
+			game_version=$( echo "$_wowi_versions" | jq -r '.[] | select(.interface == "'"$toc_version"'" and .default == true) | .id' 2>/dev/null )
 			if [ -z "$game_version" ]; then
-				game_version=$( echo $_wowi_versions | jq -r 'map(select(.interface == "'$toc_version'"))[0] | .id // empty' 2>/dev/null )
+				game_version=$( echo "$_wowi_versions" | jq -r 'map(select(.interface == "'"$toc_version"'"))[0] | .id // empty' 2>/dev/null )
 			fi
 			if [ -z "$game_version" ]; then
-				game_version=$( echo $_wowi_versions | jq -r '.[] | select(.default == true) | .id' 2>/dev/null )
+				game_version=$( echo "$_wowi_versions" | jq -r '.[] | select(.default == true) | .id' 2>/dev/null )
 			fi
 		fi
 		if [ -z "$game_version" ]; then
@@ -2253,7 +2308,7 @@ if [ -z "$skip_zipfile" ]; then
 			_ghf_resultfile="$releasedir/gh_asset_result.json"
 
 			# check if an asset exists and delete it (editing a release)
-			asset_id=$( curl -sS -H "Cache-Control: no-cache" "https://api.github.com/repos/$project_github_slug/releases/$_ghf_release_id/assets" | jq '.[] | select(.name? == "'$_ghf_file_name'") | .id' )
+			asset_id=$( curl -sS -H "Authorization: token $github_token" "https://api.github.com/repos/$project_github_slug/releases/$_ghf_release_id/assets" | jq '.[] | select(.name? == "'"$_ghf_file_name"'") | .id' )
 			if [ -n "$asset_id" ]; then
 				curl -s -H "Authorization: token $github_token" -X DELETE "https://api.github.com/repos/$project_github_slug/releases/assets/$asset_id" &>/dev/null
 			fi
@@ -2261,7 +2316,6 @@ if [ -z "$skip_zipfile" ]; then
 			echo -n "Uploading $_ghf_file_name... "
 			result=$( curl -sS --retry 3 --retry-delay 10 \
 					-w "%{http_code}" -o "$_ghf_resultfile" \
-					-H "Cache-Control: no-cache" \
 					-H "Authorization: token $github_token" \
 					-H "Content-Type: application/zip" \
 					--data-binary "@$_ghf_file_path" \
@@ -2288,7 +2342,7 @@ if [ -z "$skip_zipfile" ]; then
 		{
 		  "tag_name": "$tag",
 		  "name": "$tag",
-		  "body": $( cat "$pkgdir/$changelog" | jq --slurp --raw-input '.' ),
+		  "body": $( jq --slurp --raw-input '.' < "$pkgdir/$changelog" ),
 		  "draft": false,
 		  "prerelease": $( [[ "${tag,,}" == *"beta"* ]] && echo true || echo false )
 		}
@@ -2296,58 +2350,38 @@ if [ -z "$skip_zipfile" ]; then
 		)
 		resultfile="$releasedir/gh_result.json"
 
-		release_id=$( curl -sS -H "Cache-Control: no-cache" "https://api.github.com/repos/$project_github_slug/releases/tags/$tag" | jq '.id // empty' )
+		release_id=$( curl -sS -H "Authorization: token $github_token" "https://api.github.com/repos/$project_github_slug/releases/tags/$tag" | jq '.id // empty' )
 		if [ -n "$release_id" ]; then
 			echo "Updating GitHub release: https://github.com/$project_github_slug/releases/tag/$tag"
-			result=$( echo "$_gh_payload" | curl -sS --retry 3 --retry-delay 10 \
-					-w "%{http_code}" -o "$resultfile" \
-					-H "Cache-Control: no-cache" \
-					-H "Authorization: token $github_token" \
-					-X PATCH \
-					-d @- \
-					"https://api.github.com/repos/$project_github_slug/releases/$release_id" ) &&
-			{
-				if [ "$result" = "200" ]; then
-					upload_github_asset "$release_id" "$archive_name" "$archive"
-					if [ -f "$nolib_archive" ]; then
-						upload_github_asset "$release_id" "$nolib_archive_name" "$nolib_archive"
-					fi
-				else
-					echo "Error! ($result)"
-					if [ -s "$resultfile" ]; then
-						echo "$(<"$resultfile")"
-					fi
-					exit_code=1
-				fi
-			} || {
-				exit_code=1
-			}
+			_gh_release_url="-X PATCH https://api.github.com/repos/$project_github_slug/releases/$release_id"
 		else
 			echo "Creating GitHub release: https://github.com/$project_github_slug/releases/tag/$tag"
-			result=$( echo "$_gh_payload" | curl -sS --retry 3 --retry-delay 10 \
-					-w "%{http_code}" -o "$resultfile" \
-					-H "Cache-Control: no-cache" \
-					-H "Authorization: token $github_token" \
-					-d @- \
-					"https://api.github.com/repos/$project_github_slug/releases" ) &&
-			{
-				if [ "$result" = "201" ]; then
-					release_id=$( cat "$resultfile" | jq '.id' )
-					upload_github_asset "$release_id" "$archive_name" "$archive"
-					if [ -f "$nolib_archive" ]; then
-						upload_github_asset "$release_id" "$nolib_archive_name" "$nolib_archive"
-					fi
-				else
-					echo "Error! ($result)"
-					if [ -s "$resultfile" ]; then
-						echo "$(<"$resultfile")"
-					fi
-					exit_code=1
-				fi
-			} || {
-				exit_code=1
-			}
+			_gh_release_url="https://api.github.com/repos/$project_github_slug/releases"
 		fi
+		result=$( echo "$_gh_payload" | curl -sS --retry 3 --retry-delay 10 \
+				-w "%{http_code}" -o "$resultfile" \
+				-H "Authorization: token $github_token" \
+				-d @- \
+				$_gh_release_url ) &&
+		{
+			if [ "$result" = "200" ] || [ "$result" = "201" ]; then # edited || created
+				if [ -z "$release_id" ]; then
+					release_id=$( jq '.id' < "$resultfile" )
+				fi
+				upload_github_asset "$release_id" "$archive_name" "$archive"
+				if [ -f "$nolib_archive" ]; then
+					upload_github_asset "$release_id" "$nolib_archive_name" "$nolib_archive"
+				fi
+			else
+				echo "Error! ($result)"
+				if [ -s "$resultfile" ]; then
+					echo "$(<"$resultfile")"
+				fi
+				exit_code=1
+			fi
+		} || {
+			exit_code=1
+		}
 
 		rm -f "$resultfile" 2>/dev/null
 		echo
