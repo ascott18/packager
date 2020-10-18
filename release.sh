@@ -150,7 +150,6 @@ while getopts ":celLzusop:dw:r:t:g:m:" opt; do
 	c)
 		# Skip copying files into the package directory.
 		skip_copying="true"
-		skip_upload="true"
 		;;
 	e)
 		# Skip checkout of external repositories.
